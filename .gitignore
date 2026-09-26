@@ -1,0 +1,11 @@
+/obj/
+/bin/
+/release/
+NvpwrData/
+/.local/
+/Nvpwr-before-native-*.zip
+/.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates

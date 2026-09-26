@@ -1,0 +1,36 @@
+<Project ToolsVersion="4.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <Configuration Condition="'$(Configuration)' == ''">Release</Configuration>
+    <OutputType>WinExe</OutputType>
+    <AssemblyName>Nvpwr</AssemblyName>
+    <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
+    <PlatformTarget>x64</PlatformTarget>
+    <StartupObject>Nvpwr.Program</StartupObject>
+    <ApplicationManifest>app\app.manifest</ApplicationManifest>
+    <ApplicationIcon>app\nvidia.ico</ApplicationIcon>
+    <OutputPath>release\</OutputPath>
+    <IntermediateOutputPath>obj\</IntermediateOutputPath>
+    <Optimize>true</Optimize>
+    <DebugType>none</DebugType>
+    <GenerateSerializationAssemblies>Off</GenerateSerializationAssemblies>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System"/><Reference Include="System.Core"/><Reference Include="System.Xml"/><Reference Include="System.Management"/>
+    <Reference Include="System.ServiceProcess"/><Reference Include="System.Windows.Forms"/>
+    <Reference Include="System.Xaml"/><Reference Include="WindowsBase"/><Reference Include="PresentationCore"/><Reference Include="PresentationFramework"/>
+    <Compile Include="app\Native.cs"/><Compile Include="app\PowerProtocol.cs"/><Compile Include="app\SystemServices.cs"/>
+    <Compile Include="app\ConsoleProcess.cs"/><Compile Include="app\DriverEngine.cs"/><Compile Include="app\LogBook.cs"/>
+    <Compile Include="app\UiController.cs"/><Compile Include="app\Program.cs"/><Compile Include="tests\Native.Tests.cs"/>
+    <EmbeddedResource Include="app\MainWindow.xaml"><LogicalName>Nvpwr.MainWindow.xaml</LogicalName></EmbeddedResource>
+    <EmbeddedResource Include="app\nvidia.ico"><LogicalName>Nvpwr.AppIcon</LogicalName></EmbeddedResource>
+    <EmbeddedResource Include="README.txt"><LogicalName>Nvpwr.Readme</LogicalName></EmbeddedResource>
+    <EmbeddedResource Include="vendor\Nvpwr.sys"><LogicalName>Nvpwr.Payload.Nvpwr.sys</LogicalName></EmbeddedResource>
+    <EmbeddedResource Include="vendor\NvpwrCtl.exe"><LogicalName>Nvpwr.Payload.NvpwrCtl.exe</LogicalName></EmbeddedResource>
+    <EmbeddedResource Include="vendor\KDU.exe"><LogicalName>Nvpwr.Payload.KDU.exe</LogicalName></EmbeddedResource>
+    <EmbeddedResource Include="vendor\drv64.dll"><LogicalName>Nvpwr.Payload.drv64.dll</LogicalName></EmbeddedResource>
+    <EmbeddedResource Include="vendor\EfiDSEFix.exe"><LogicalName>Nvpwr.Payload.EfiDSEFix.exe</LogicalName></EmbeddedResource>
+    <EmbeddedResource Include="vendor\bootx64.efi"><LogicalName>Nvpwr.Payload.bootx64.efi</LogicalName></EmbeddedResource>
+    <EmbeddedResource Include="vendor\EfiGuardDxe.efi"><LogicalName>Nvpwr.Payload.EfiGuardDxe.efi</LogicalName></EmbeddedResource>
+  </ItemGroup>
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets"/>
+</Project>

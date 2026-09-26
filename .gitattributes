@@ -1,0 +1,9 @@
+* text=auto
+
+*.exe binary
+*.dll binary
+*.sys binary
+*.efi binary
+*.ico binary
+*.png binary
+*.zip binary
