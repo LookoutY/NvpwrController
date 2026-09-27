@@ -30,9 +30,24 @@ internal static class NativeTests
                 Check(string.Equals(System.IO.Path.GetDirectoryName(AppPaths.Beside(name)), dataDirectory, StringComparison.OrdinalIgnoreCase), "State escaped NvpwrData");
             foreach (AssetInfo file in BundleAssets.Files.Where(asset => asset.Key != "efiboot" && asset.Key != "efidriver"))
                 Check(System.IO.Path.GetFileName(file.RelativePath) == file.RelativePath, "Runtime component is not a sibling file");
-            Check(PowerProtocol.Targets().Length == 26, "Target list size");
-            Check(PowerProtocol.Targets().First() == 175 && PowerProtocol.Targets().Last() == 300, "Unified range");
-            foreach (int value in new[] { 0, 170, 177, 305, 1000 }) Check(!PowerProtocol.IsValid(value), "Invalid target accepted: " + value);
+            foreach (int baseline in new[] { 45, 80, 115, 140, 175 })
+                Check(PowerProtocol.ReadOemBaseline("OEM baseline : " + baseline * 1000 + " (" + baseline + ".000 W)") == baseline, "Device OEM baseline was not read: " + baseline);
+            Check(PowerProtocol.ReadOemBaseline("OEM baseline : 115500 (115.500 W)") == 115.5m, "Fractional OEM baseline was rounded");
+            Check(!PowerProtocol.ReadOemBaseline(null).HasValue, "Missing OEM baseline became a fixed fallback");
+            Check(!PowerProtocol.ReadOemBaseline("OEM baseline : 0 (0.000 W)").HasValue, "Uninitialized OEM baseline accepted");
+            Check(!PowerProtocol.ReadOemBaseline("OEM baseline : 140000 (115.000 W)").HasValue, "Inconsistent OEM units accepted");
+            Check(!PowerProtocol.ReadOemBaseline("OEM baseline : 115000 (115.000 W)\nOEM baseline : 140000 (140.000 W)").HasValue, "Ambiguous OEM baseline accepted");
+            Check(!PowerProtocol.ReadOemBaseline("OEM baseline : 115000 (115.000 W)\nOEM baseline : unknown").HasValue, "Malformed duplicate OEM baseline accepted");
+            foreach (int baseline in new[] { 45, 80, 115, 140, 175 }) {
+                var range = new PowerRange(baseline);
+                Check(range.Targets().First() == baseline && range.Targets().Last() == 300, "Range ignored this device's OEM baseline");
+                Check(range.Contains(baseline) && !range.Contains(baseline - 5), "Range allowed power below the OEM baseline");
+            }
+            Check(new PowerRange(115.5m).MinimumWatts == 120, "Fractional baseline rounded downward");
+            Check(new PowerRange(300).Targets().SequenceEqual(new[] { 300 }), "Upper-edge baseline range failed");
+            Reject(() => new PowerRange(0), "Zero baseline accepted");
+            Reject(() => new PowerRange(301), "OEM baseline above the software ceiling accepted");
+            foreach (int value in new[] { 0, 3, 177, 305, 1000 }) Check(!PowerProtocol.IsValid(value), "Invalid target accepted: " + value);
             foreach (int value in PowerProtocol.Targets()) Check(PowerProtocol.IsValid(value), "Listed target rejected");
             PowerResult mismatch = PowerProtocol.Parse("Current F7: 200000 (200.000 W)", 6, 175);
             Check(mismatch.Outcome == "Mismatch" && mismatch.RestartRequired && mismatch.Watts == 200, "Mismatch readback");
@@ -54,9 +69,10 @@ internal static class NativeTests
             Check(!PowerProtocol.Parse(stock.Replace("Win32=23", "Win32=5"), 6, 175).Verified, "Different error accepted");
             Check(!PowerProtocol.Parse(stock.Replace("STOCK_BASELINE (9)", "APPLIED (2)"), 6, 175).Verified, "Wrong state accepted");
             Check(!PowerProtocol.Parse(stock.Replace("Last NTSTATUS : 0x00000000", "Last NTSTATUS : 0xC0000001"), 6, 175).Verified, "Kernel failure accepted");
-            foreach (int watts in new[] { 175, 200, 225, 300 })
+            foreach (int watts in new[] { 45, 80, 115, 140, 175, 200, 225, 300 })
                 Check(PowerProtocol.Parse("Current F7: " + watts * 1000 + " (" + watts + ".000 W)", 0, watts).Verified, "Normal result rejected");
             TestDrivers();
+            TestDevicePowerRanges();
             TestSigningSettings();
             Console.WriteLine("PASS: " + assertions + " native C# power protocol assertions; no system mutations.");
             return 0;
@@ -77,7 +93,7 @@ internal static class NativeTests
         var engine = new DriverEngine(fake, delegate { });
         engine.Load(DriverBackend.Kdu);
         Check(engine.Session.Ready && !engine.Session.NeedsRestore && fake.Flags == 14, "KDU original flags not restored");
-        Check(fake.Commands.Last() == "kdu -dse 14", "KDU restore order");
+        Check(fake.Commands[fake.Commands.Count - 2] == "kdu -dse 14" && fake.Commands.Last() == "controller status", "Power query must follow DSE recovery");
         Reject(() => engine.Load(DriverBackend.EfiGuard), "Backend switched while active");
         engine.SetPower(200);
         Check(engine.Session.LastReadback == 200, "Native power result not recorded");
@@ -96,7 +112,7 @@ internal static class NativeTests
         PowerResult timeout = engine.SetPower(175);
         Check(timeout.Outcome == "NvidiaTimeout" && !timeout.Verified && engine.Session.LastReadback == 175, "Engine lost the timeout classification or observed value");
         Check(engine.Session.Ready && !engine.Session.RestartRequired && !engine.Session.NeedsRestore, "Matching timeout unnecessarily reset driver readiness");
-        Check(fake.Commands.Count == count + 1 && fake.Commands.Last() == "controller set 5050 175", "Timeout automatically retried a power write or changed the driver");
+        Check(fake.Commands.Count == count + 2 && fake.Commands[count] == "controller status" && fake.Commands.Last() == "controller set 5050 175", "Timeout automatically retried a power write or changed the driver");
         Check(powerLog.Last().Contains("NVIDIA=0x00000065") && powerLog.Last().Contains("elapsed=") && powerLog.Last().Contains("outcome=NvidiaTimeout"), "Timeout diagnostics not preserved in the operation log");
         fake.ControllerResponse = null;
         Check(engine.SetPower(175).Verified, "An explicit later retry could not succeed after a timeout");
@@ -133,9 +149,9 @@ internal static class NativeTests
         fake = new FakeSystem { Driver = new DriverService { State = "Running", Path = @"C:\Nvpwr test\driver" } };
         engine = new DriverEngine(fake, delegate { });
         engine.Load(DriverBackend.Kdu);
-        Check(engine.Session.Ready && !engine.Session.OwnsDriver && fake.Commands.Count == 0, "Existing running driver was not attached safely");
+        Check(engine.Session.Ready && !engine.Session.OwnsDriver && fake.Commands.SequenceEqual(new[] { "controller status" }), "Existing running driver was not attached safely");
         engine.Stop();
-        Check(fake.Driver.State == "Running" && fake.Commands.Count == 0, "Externally owned driver was stopped");
+        Check(fake.Driver.State == "Running" && fake.Commands.SequenceEqual(new[] { "controller status" }), "Externally owned driver was stopped");
 
         fake = new FakeSystem { FailStart = true };
         engine = new DriverEngine(fake, delegate { });
@@ -151,7 +167,7 @@ internal static class NativeTests
         engine.Load(DriverBackend.EfiGuard);
         Check(engine.Session.Ready && !engine.Session.NeedsRestore && fake.Flags == 14, "EFI did not restore captured flags");
         Check(fake.Commands.Contains("efifix -c") && fake.Commands.Contains("efifix -e E"), "EFI protocol must check then restore with -e");
-        Check(fake.Commands.Last() == "efifix -r", "EFI restoration must be read back");
+        Check(fake.Commands[fake.Commands.Count - 2] == "efifix -r" && fake.Commands.Last() == "controller status", "EFI restoration must be read back before querying power");
         engine.Stop();
         fake = new FakeSystem { EfiAvailable = false };
         engine = new DriverEngine(fake, delegate { });
@@ -176,6 +192,52 @@ internal static class NativeTests
         engine = new DriverEngine(fake, delegate { });
         Reject(() => engine.Load(DriverBackend.EfiGuard), "EFI VBS guard failed");
         Check(fake.Commands.Count == 0, "EFI ran with VBS enabled");
+    }
+
+    private static void TestDevicePowerRanges()
+    {
+        foreach (int baseline in new[] { 45, 80, 115, 140, 175 }) {
+            var fake = new FakeSystem { OemWatts = baseline };
+            var engine = new DriverEngine(fake, delegate { });
+            engine.Load(DriverBackend.Kdu);
+            Check(engine.Session.PowerRange != null && engine.Session.PowerRange.MinimumWatts == baseline, "Load did not discover the OEM baseline");
+            Check(!fake.Commands.Any(command => command.StartsWith("controller set ")), "Baseline discovery wrote power");
+            Check(engine.SetPower(baseline + 5).Verified, "Lower-power GPU target was rejected");
+            Check(engine.SetPower(baseline).Verified, "Explicit reduction back to the OEM baseline was rejected");
+            int writes = fake.Commands.Count(command => command.StartsWith("controller set "));
+            Reject(() => engine.SetPower(baseline - 5), "Power below the OEM baseline was dispatched");
+            Check(fake.Commands.Count(command => command.StartsWith("controller set ")) == writes, "Rejected low target still wrote power");
+            fake.OemWatts = baseline + 10;
+            Reject(() => engine.SetPower(baseline + 5), "Changed OEM mode used a stale lower bound");
+            Check(engine.Session.PowerRange.MinimumWatts == baseline + 10, "Changed OEM range was not exposed to the UI");
+            Check(fake.Commands.Count(command => command.StartsWith("controller set ")) == writes, "OEM mode change still dispatched a stale target");
+            engine.Stop();
+            Check(engine.Session.PowerRange == null, "Stopped session retained an actionable power range");
+        }
+        foreach (string invalid in new[] {
+            "OEM baseline : 115000 (115.000 W)",
+            FakeSystem.Status(0),
+            FakeSystem.Status(115).Replace("115000 (115.000 W)", "115000 (140.000 W)"),
+            FakeSystem.Status(115).Replace("STOCK_BASELINE (9)", "MIXED (3)"),
+            FakeSystem.Status(115).Replace("0x00000000", "0xC0000001"),
+            FakeSystem.Status(115).Replace("Current F7 : 115000", "Current F7 : 140000")
+        }) {
+            var fake = new FakeSystem { StatusResponse = new ProcessResult { ExitCode = 0, Output = invalid } };
+            var engine = new DriverEngine(fake, delegate { });
+            engine.Load(DriverBackend.Kdu);
+            Check(engine.Session.Ready && engine.Session.PowerRange == null && !string.IsNullOrEmpty(engine.Session.PowerRangeError), "Unknown baseline was treated as 175 W");
+            Reject(() => engine.SetPower(200), "Unknown OEM baseline allowed a power write");
+            Check(!fake.Commands.Any(command => command.StartsWith("controller set ")), "Unknown baseline dispatched a set command");
+        }
+        var failedQuery = new FakeSystem { StatusResponse = new ProcessResult { ExitCode = 3, Output = FakeSystem.Status(115) } };
+        var failedEngine = new DriverEngine(failedQuery, delegate { });
+        failedEngine.Load(DriverBackend.Kdu);
+        Check(failedEngine.Session.PowerRange == null, "Nonzero query exit accepted a baseline");
+        failedQuery.StatusResponse = null;
+        failedEngine.RefreshPowerRange();
+        Check(failedEngine.Session.PowerRange != null, "Explicit refresh could not recover a query failure");
+        string applied = FakeSystem.Status(175).Replace("STOCK_BASELINE (9)", "APPLIED (2)").Replace("175000 (175.000 W)", "200000 (200.000 W)").Replace("OEM baseline : 200000 (200.000 W)", "OEM baseline : 175000 (175.000 W)");
+        Check(PowerProtocol.ReadRange(applied).OemWatts == 175, "Active target was mistaken for the original OEM baseline");
     }
 
     private static void TestSigningSettings()
@@ -245,6 +307,8 @@ internal static class NativeTests
         public bool EfiAvailable = true;
         public uint Flags = 14;
         public ProcessResult ControllerResponse;
+        public ProcessResult StatusResponse;
+        public int OemWatts = 175;
         public DriverService Driver;
         public bool Administrator { get { return AdministratorAvailable; } }
         public SecurityState ReadSecurity() { return Security; }
@@ -252,6 +316,12 @@ internal static class NativeTests
         public DriverService ReadDriver() { return Driver; }
         public void WaitDriver(string state) { if (Driver == null || Driver.State != state) throw new InvalidOperationException("Unexpected service state"); }
         public string Asset(string key) { return @"C:\Nvpwr test\" + key; }
+        public static string Status(int baseline)
+        {
+            string value = baseline * 1000 + " (" + baseline + ".000 W)";
+            return "State : STOCK_BASELINE (9)\nLast NTSTATUS : 0x00000000\nOEM baseline : " + value + "\nUPPER (+3D24) : " + value +
+                "\nMAX effective : " + value + "\nCurrent effective : " + value + "\nCurrent F7 : " + value;
+        }
         public ProcessResult Run(string executable, string arguments)
         {
             string name = System.IO.Path.GetFileName(executable);
@@ -290,6 +360,7 @@ internal static class NativeTests
                 if (arguments == "stop Nvpwr") Driver.State = "Stopped";
             }
             if (name == "controller") {
+                if (arguments == "status") return StatusResponse ?? new ProcessResult { ExitCode = 0, Output = Status(OemWatts) };
                 if (ControllerResponse != null) return ControllerResponse;
                 int watts = int.Parse(arguments.Split(' ')[2]);
                 return new ProcessResult { ExitCode = 0, Output = "Current F7: " + watts * 1000 + " (" + watts + ".000 W)" };
