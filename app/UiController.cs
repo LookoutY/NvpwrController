@@ -35,6 +35,8 @@ namespace Nvpwr
         private string readOnlyReason = "ReadOnlyMode";
         private string lastHardwareError;
         private string lastOutcome;
+        private PowerRange previewPowerRange = new PowerRange(140);
+        private PowerRange displayedPowerRange;
         public bool StartupComplete { get; private set; }
         public string LastError { get; private set; }
 
@@ -49,6 +51,7 @@ namespace Nvpwr
         private string Message(string key) { return Convert.ToString(Window.Resources[key]); }
         private Brush Brush(string key) { return (Brush)Window.Resources[key]; }
         private bool Writable { get { return system.Administrator && !readOnly && !preview && !diagnostic; } }
+        private PowerRange CurrentPowerRange { get { return preview ? snapshot == null ? null : previewPowerRange : engine.Session.PowerRange; } }
         private string State(bool? state) { return Message(state.HasValue ? state.Value ? "On" : "Off" : "Unknown"); }
 
         public UiController(bool preview, bool readOnly, bool diagnostic, bool manualLoad)
@@ -63,9 +66,8 @@ namespace Nvpwr
             }
             engine = new DriverEngine(system, AppendLog);
             ReadBackend();
-            Find<ComboBox>("WattInput").ItemsSource = PowerProtocol.Targets();
-            Find<ComboBox>("WattInput").Text = "175";
-            Text("RangeLabel").Text = "175-300 W / 5 W";
+            Find<ComboBox>("WattInput").ItemsSource = new int[0];
+            Find<ComboBox>("WattInput").Text = "";
             Find<ComboBox>("LogSessions").ItemsSource = logBook.Sessions;
             Find<ComboBox>("LogSessions").DisplayMemberPath = "Label";
             Find<ComboBox>("LogSessions").SelectionChanged += delegate { RenderLog(); };
@@ -192,7 +194,11 @@ namespace Nvpwr
 
         private async Task Refresh()
         {
-            bool succeeded = await Perform("RefreshTitle", () => preview ? PreviewSnapshot() : system.Snapshot(), ApplySnapshot, true);
+            bool succeeded = await Perform("RefreshTitle", () => {
+                SystemSnapshot value = preview ? PreviewSnapshot() : system.Snapshot();
+                if (!preview && engine.Session.Ready) engine.RefreshPowerRange();
+                return value;
+            }, ApplySnapshot, true);
             StartupComplete = true;
             if (succeeded && !autoAttempted && !manualLoad && Writable) {
                 autoAttempted = true;
@@ -203,7 +209,7 @@ namespace Nvpwr
         private SystemSnapshot PreviewSnapshot()
         {
             return new SystemSnapshot {
-                Gpu = new GpuInfo { Name = "NVIDIA GeForce RTX 5090 Laptop GPU", DriverVersion = "32.0.16.1692" }, ServiceState = "Stopped",
+                Gpu = new GpuInfo { Name = "NVIDIA GeForce RTX 5070 Ti Laptop GPU", DriverVersion = "32.0.16.1692" }, ServiceState = "Stopped",
                 Security = new SecurityState { TestSigning = false, BootTestSigning = false, SecureBoot = false, Firmware = "UEFI", HvciRunning = false, HvciConfigured = false, VbsRunning = false, CodeIntegrityEnabled = true, BlocklistConfigured = false }
             };
         }
@@ -246,18 +252,19 @@ namespace Nvpwr
 
         private void UpdateControls()
         {
+            UpdatePowerInput();
             bool writable = Writable && !busy;
             bool knownGpu = snapshot != null && snapshot.Gpu != null;
             bool acknowledged = Find<CheckBox>("RiskAccepted").IsChecked == true;
             DriverSession session = engine.Session;
             Button("LoadButton").IsEnabled = writable && CanLoad() && !session.Ready && !session.NeedsRestore && !session.RestartRequired;
             Button("UnloadButton").IsEnabled = writable && (session.Ready || session.OwnsDriver || session.NeedsRestore);
-            Button("ApplyButton").IsEnabled = writable && session.Ready && acknowledged && !session.NeedsRestore && !session.RestartRequired;
+            Button("ApplyButton").IsEnabled = writable && session.Ready && acknowledged && Target().HasValue && !session.NeedsRestore && !session.RestartRequired;
             Button("RestartGpuButton").IsEnabled = writable && knownGpu;
             Button("RecoverButton").IsEnabled = writable;
             Button("RecoverButton").Visibility = session.NeedsRestore ? Visibility.Visible : Visibility.Collapsed;
             Button("RefreshButton").IsEnabled = !busy;
-            Find<ComboBox>("WattInput").IsEnabled = !busy && knownGpu;
+            Find<ComboBox>("WattInput").IsEnabled = !busy && knownGpu && CurrentPowerRange != null;
             Find<CheckBox>("RiskAccepted").IsEnabled = !busy && knownGpu;
             string switchBlocker = BackendSwitchBlocker();
             bool switchable = switchBlocker == null;
@@ -278,11 +285,12 @@ namespace Nvpwr
             Text("AccessLabel").Text = Message(preview ? "PreviewMode" : Writable ? "AdminMode" : "ReadOnlyMode");
             string reason = preview ? "PreviewNotice" : readOnly ? readOnlyReason : !system.Administrator ? "NeedAdministrator" : busy ? "Busy" :
                 session.NeedsRestore ? "RecoveryRequired" : snapshot == null ? "Detecting" : !knownGpu ? "GpuUnavailable" :
-                session.RestartRequired ? "GpuRestartRequired" : session.Ready && !acknowledged ? "RiskNotAccepted" : session.Ready ? "SessionAvailable" :
+                session.RestartRequired ? "GpuRestartRequired" : session.Ready && CurrentPowerRange == null ? "PowerRangeUnavailable" :
+                session.Ready && !acknowledged ? "RiskNotAccepted" : session.Ready ? "SessionAvailable" :
                 snapshot.Security.HvciRunning != false ? "HvciActive" : snapshot.Security.CodeIntegrityEnabled != true ? "CiUnavailable" :
                 backend == DriverBackend.EfiGuard && (snapshot.Security.Firmware != "UEFI" || snapshot.Security.VbsRunning != false) ? "EfiBlocked" : "DriverAvailable";
             Text("ModeText").Text = Message(reason); Find<Border>("ModeBanner").Visibility = Visibility.Visible;
-            string tone = reason == "RecoveryRequired" || reason == "CiUnavailable" || reason == "GpuUnavailable" ? "Danger" : reason == "HvciActive" || reason == "RiskNotAccepted" || reason == "EfiBlocked" ? "Warning" : "Good";
+            string tone = reason == "RecoveryRequired" || reason == "CiUnavailable" || reason == "GpuUnavailable" ? "Danger" : reason == "HvciActive" || reason == "RiskNotAccepted" || reason == "EfiBlocked" || reason == "PowerRangeUnavailable" ? "Warning" : "Good";
             Text("ModeText").Foreground = Brush(tone);
             Find<Border>("ModeBanner").Background = Brush(tone == "Good" ? "NoticeSurface" : tone + "Surface");
             Button("LoadButton").ToolTip = Message(reason); Button("ApplyButton").ToolTip = Message(reason);
@@ -290,21 +298,48 @@ namespace Nvpwr
             Text("ReadbackDetail").Text = !session.LastReadback.HasValue ? Message("ReadbackEmpty") : lastOutcome == "StockBaseline" ? Message("OemBaseline") : "Current F7 / NvpwrCtl";
         }
 
+        private void UpdatePowerInput()
+        {
+            PowerRange range = CurrentPowerRange;
+            ComboBox input = Find<ComboBox>("WattInput");
+            bool changed = (range == null) != (displayedPowerRange == null) ||
+                (range != null && displayedPowerRange != null && (range.OemWatts != displayedPowerRange.OemWatts || range.MaximumWatts != displayedPowerRange.MaximumWatts));
+            if (changed) {
+                displayedPowerRange = range;
+                syncing = true;
+                input.ItemsSource = range == null ? new int[0] : range.Targets();
+                input.Text = range == null ? "" : range.MinimumWatts.ToString(CultureInfo.InvariantCulture);
+                syncing = false;
+            }
+            Text("RangeLabel").Text = range == null ? Message("PowerRangePending") : string.Format(Message("PowerRange"), range.MinimumWatts, range.MaximumWatts);
+            Text("OemValue").Text = range == null ? Message("OemUnknown") : string.Format(CultureInfo.InvariantCulture, Message("OemValueFormat"), range.OemWatts);
+            input.ToolTip = range == null ? Message("PowerRangeUnavailable") : string.Format(CultureInfo.InvariantCulture, Message("PowerRangeHint"), range.OemWatts, range.MinimumWatts, range.MaximumWatts);
+            Text("InputError").Text = InvalidPowerMessage();
+            Text("InputError").Visibility = range != null && !Target().HasValue ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        private string InvalidPowerMessage()
+        {
+            PowerRange range = CurrentPowerRange;
+            return range == null ? Message("PowerRangeUnavailable") : string.Format(Message("InvalidWatts"), range.MinimumWatts, range.MaximumWatts);
+        }
+
         private int? Target()
         {
             int watts;
-            return int.TryParse(Find<ComboBox>("WattInput").Text, out watts) && PowerProtocol.IsValid(watts) ? (int?)watts : null;
+            return CurrentPowerRange != null && int.TryParse(Find<ComboBox>("WattInput").Text, out watts) && CurrentPowerRange.Contains(watts) ? (int?)watts : null;
         }
         private void ValidateInput()
         {
             if (syncing) return;
-            Text("InputError").Text = Message("InvalidWattsFixed"); Text("InputError").Visibility = Target().HasValue ? Visibility.Collapsed : Visibility.Visible;
+            UpdateControls();
         }
 
         private async Task Load()
         {
             await Perform("LoadTitle", () => { engine.Load(backend); return true; }, ignored => {
-                snapshot.ServiceState = "Running"; Text("DriverState").Text = Message("Running"); SetStatus(Message(engine.Session.OwnsDriver ? "DriverReady" : "DriverAttached"), "Good");
+                snapshot.ServiceState = "Running"; Text("DriverState").Text = Message("Running");
+                SetStatus(Message(engine.Session.PowerRange == null ? "PowerRangeUnavailable" : engine.Session.OwnsDriver ? "DriverReady" : "DriverAttached"), engine.Session.PowerRange == null ? "Warning" : "Good");
             });
         }
 
@@ -312,7 +347,7 @@ namespace Nvpwr
         {
             if (!Button("ApplyButton").IsEnabled || !Writable) return;
             int? target = Target();
-            if (!target.HasValue) { Alert(Message("InvalidWattsFixed"), Message("InvalidPowerTitle"), MessageBoxImage.Warning); return; }
+            if (!target.HasValue) { Alert(InvalidPowerMessage(), Message("InvalidPowerTitle"), MessageBoxImage.Warning); return; }
             PowerResult actual = null;
             await Perform("ApplyTitle", () => engine.SetPower(target.Value), result => {
                 actual = result; lastOutcome = result.Outcome; UpdateControls();
@@ -524,11 +559,31 @@ namespace Nvpwr
             string timeoutMessage = PowerFailureMessage(new PowerResult { Target = 175, Watts = 175, ExitCode = 6, NvidiaStatus = 0x65, NtStatus = 0, DurationMilliseconds = 2000, Outcome = "NvidiaTimeout" });
             if (!timeoutMessage.Contains("NV_ERR_TIMEOUT") || !timeoutMessage.Contains("175 W") || !timeoutMessage.Contains("2000 ms"))
                 throw new InvalidOperationException("Specific NVIDIA timeout diagnostics are missing.");
+            foreach (int baseline in new[] { 45, 80, 115, 140, 175 }) {
+                previewPowerRange = new PowerRange(baseline); UpdateControls();
+                if (Target() != baseline || ((int[])Find<ComboBox>("WattInput").ItemsSource).First() != baseline || !Text("OemValue").Text.Contains(baseline.ToString()))
+                    throw new InvalidOperationException("UI did not use the detected OEM baseline.");
+                Find<ComboBox>("WattInput").Text = (baseline - 5).ToString();
+                if (Target().HasValue || Text("InputError").Visibility != Visibility.Visible) throw new InvalidOperationException("UI allowed a below-baseline target.");
+            }
+            previewPowerRange = null; UpdateControls();
+            if (Target().HasValue || Find<ComboBox>("WattInput").IsEnabled || Find<ComboBox>("WattInput").Text != "")
+                throw new InvalidOperationException("Unknown OEM baseline left a usable fixed power input.");
+            previewPowerRange = new PowerRange(140); UpdateControls();
             Find<ComboBox>("WattInput").Text = "305"; if (Target().HasValue) throw new InvalidOperationException("Input range exceeds 300 W.");
             Find<ComboBox>("WattInput").Text = "200"; if (Target() != 200) throw new InvalidOperationException("Power input failed.");
             BeginLog("First operation"); AppendLog("first-only"); FinishLog(true);
             BeginLog("Second operation"); AppendLog("second-only"); FinishLog(true);
             if (SelectedLog().Contains("first-only")) throw new InvalidOperationException("Log groups are mixed.");
+            logBook.Sessions.Clear();
+            BeginLog(Message("RefreshTitle"));
+            AppendLog(Message("PreviewNotice"));
+            AppendLog("GPU: " + snapshot.Gpu.Name);
+            AppendLog("OEM baseline: 140 W\nSelectable: 140-300 W / 5 W\nSoftware ceiling is not a hardware rating.");
+            AppendLog("Test signing: OFF\nKernel code integrity: ON\nMemory integrity: OFF");
+            AppendLog("Power was not applied. Preview only.");
+            FinishLog(true);
+            Find<ComboBox>("WattInput").Text = "140";
             foreach (DriverBackend mode in new[] { DriverBackend.Kdu, DriverBackend.EfiGuard }) {
                 backend = mode; Find<RadioButton>(mode == DriverBackend.Kdu ? "BackendKdu" : "BackendEfi").IsChecked = true; FillFiles(); UpdateControls();
                 foreach (string page in new[] { "Power", "Security", "Files" }) {
@@ -543,7 +598,7 @@ namespace Nvpwr
                         throw new InvalidOperationException("The three security settings entries are not aligned consistently.");
                     if (Find<TextBox>("LogBox").ActualHeight < 320) throw new InvalidOperationException("Log pane is too short.");
                     FrameworkElement visual = Find<FrameworkElement>("RootLayout");
-                    var image = new RenderTargetBitmap((int)visual.ActualWidth, (int)visual.ActualHeight, 96, 96, PixelFormats.Pbgra32); image.Render(visual);
+                    var image = new RenderTargetBitmap((int)Math.Ceiling(visual.ActualWidth * 2), (int)Math.Ceiling(visual.ActualHeight * 2), 192, 192, PixelFormats.Pbgra32); image.Render(visual);
                     var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(image));
                     using (FileStream output = File.Create(Path.Combine(directory, mode + "-" + page + ".png"))) encoder.Save(output);
                 }

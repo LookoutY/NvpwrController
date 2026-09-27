@@ -8,6 +8,32 @@ namespace Nvpwr
 {
     public enum DriverBackend { Kdu, EfiGuard }
 
+    public sealed class PowerRange
+    {
+        public decimal OemWatts { get; private set; }
+        public int MinimumWatts { get; private set; }
+        public int MaximumWatts { get { return PowerProtocol.MaximumWatts; } }
+
+        public PowerRange(decimal oemWatts)
+        {
+            if (oemWatts < PowerProtocol.MinimumWatts || oemWatts > PowerProtocol.MaximumWatts)
+                throw new ArgumentOutOfRangeException("oemWatts", "OEM baseline is outside this application's power range.");
+            OemWatts = oemWatts;
+            MinimumWatts = (int)(Math.Ceiling(oemWatts / PowerProtocol.StepWatts) * PowerProtocol.StepWatts);
+        }
+
+        public bool Contains(int watts)
+        {
+            return PowerProtocol.IsValid(watts) && watts >= MinimumWatts;
+        }
+
+        public int[] Targets()
+        {
+            return Enumerable.Range(0, (MaximumWatts - MinimumWatts) / PowerProtocol.StepWatts + 1)
+                .Select(index => MinimumWatts + index * PowerProtocol.StepWatts).ToArray();
+        }
+    }
+
     public sealed class PowerResult
     {
         public int Target { get; set; }
@@ -24,9 +50,43 @@ namespace Nvpwr
 
     public static class PowerProtocol
     {
-        public const int MinimumWatts = 175;
+        public const int MinimumWatts = 5;
         public const int MaximumWatts = 300;
         public const int StepWatts = 5;
+
+        public static decimal? ReadOemBaseline(string output)
+        {
+            return ReadPower(output, "OEM baseline");
+        }
+
+        private static decimal? ReadPower(string output, string label)
+        {
+            string text = (output ?? "").Replace("\r", "");
+            string prefix = @"(?im)^[ \t]*" + Regex.Escape(label) + @"[ \t]*:";
+            if (Regex.Matches(text, prefix).Count != 1) return null;
+            Match value = Regex.Match(text, prefix + @"[ \t]*(\d+)[ \t]*\(([0-9]+(?:\.[0-9]+)?)[ \t]*W\)[ \t]*$");
+            long raw;
+            decimal shown;
+            if (!value.Success || !long.TryParse(value.Groups[1].Value, out raw) || raw <= 0 ||
+                !decimal.TryParse(value.Groups[2].Value, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out shown) || shown != raw / 1000m)
+                return null;
+            return shown;
+        }
+
+        public static PowerRange ReadRange(string output)
+        {
+            string text = (output ?? "").Replace("\r", "");
+            MatchCollection states = Regex.Matches(text, @"(?im)^[ \t]*State[ \t]*:[^\n]*$");
+            bool stock = states.Count == 1 && Regex.IsMatch(states[0].Value, @":[ \t]*STOCK_BASELINE[ \t]*\(9\)[ \t]*$");
+            bool applied = states.Count == 1 && Regex.IsMatch(states[0].Value, @":[ \t]*APPLIED[ \t]*\(2\)[ \t]*$");
+            decimal? baseline = ReadOemBaseline(text);
+            decimal? upper = ReadPower(text, "UPPER (+3D24)");
+            if ((!stock && !applied) || ReadStatus(text, "Last NTSTATUS") != 0 || !baseline.HasValue || !upper.HasValue ||
+                ReadPower(text, "MAX effective") != upper || ReadPower(text, "Current effective") != upper ||
+                ReadPower(text, "Current F7") != upper || (stock && upper != baseline))
+                throw new InvalidOperationException("A coherent OEM baseline could not be confirmed. Refresh the status or restart the GPU before changing power.");
+            return new PowerRange(baseline.Value);
+        }
 
         public static bool IsValid(int watts)
         {
@@ -41,7 +101,7 @@ namespace Nvpwr
 
         public static PowerResult Parse(string output, int exitCode, int target)
         {
-            if (!IsValid(target)) throw new ArgumentOutOfRangeException("target", "Expected 175-300 W in 5 W steps.");
+            if (!IsValid(target)) throw new ArgumentOutOfRangeException("target", "Expected a power target within the software bounds in 5 W steps.");
             var result = new PowerResult { Target = target, ExitCode = exitCode, Output = output ?? "", Outcome = "ReadbackUnavailable", RestartRequired = true };
             result.NvidiaStatus = ReadStatus(result.Output, "Last NVIDIA status");
             result.NtStatus = ReadStatus(result.Output, "Last NTSTATUS");
@@ -66,6 +126,7 @@ namespace Nvpwr
 
         private static uint? ReadStatus(string output, string label)
         {
+            if (Regex.Matches(output, @"(?im)^[ \t]*" + Regex.Escape(label) + @"[ \t]*:").Count != 1) return null;
             MatchCollection matches = Regex.Matches(output.Replace("\r", ""), @"(?im)^[ \t]*" + Regex.Escape(label) + @"[ \t]*:[ \t]*0x([0-9a-f]{1,8})[ \t]*$");
             uint value;
             return matches.Count == 1 && uint.TryParse(matches[0].Groups[1].Value, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out value) ? (uint?)value : null;

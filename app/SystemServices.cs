@@ -67,7 +67,7 @@ namespace Nvpwr
 
     public sealed class BundleAssets
     {
-        public const string Version = "3.0.6";
+        public const string Version = "3.0.7";
         public static readonly AssetInfo[] Files = {
             new AssetInfo { Key = "driver", Resource = "Nvpwr.Payload.Nvpwr.sys", RelativePath = "Nvpwr.sys" },
             new AssetInfo { Key = "controller", Resource = "Nvpwr.Payload.NvpwrCtl.exe", RelativePath = "NvpwrCtl.exe" },

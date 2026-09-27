@@ -11,6 +11,8 @@ namespace Nvpwr
         public uint OriginalDse = 6;
         public decimal? LastReadback;
         public DriverBackend Backend;
+        public PowerRange PowerRange;
+        public string PowerRangeError;
     }
 
     public sealed class DriverEngine
@@ -68,6 +70,7 @@ namespace Nvpwr
                     if (!string.Equals(path, driver, StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("A different Nvpwr driver is already running. Close its owning application first.");
                     Session.Ready = true;
                     log("Attached to an existing driver; this window will not unload an externally owned session.");
+                    RefreshPowerRange();
                     return;
                 }
                 if (service.State != "Stopped") throw new InvalidOperationException("Nvpwr is not stopped: " + service.State);
@@ -102,6 +105,24 @@ namespace Nvpwr
             Session.Ready = true;
             Session.RestartRequired = false;
             log("Driver ready; temporary DSE load window closed.");
+            RefreshPowerRange();
+        }
+
+        public void RefreshPowerRange()
+        {
+            Session.PowerRange = null;
+            Session.PowerRangeError = null;
+            if (!Session.Ready || Session.NeedsRestore || Session.RestartRequired) return;
+            try {
+                system.ReadGpu();
+                ProcessResult status = Execute(system.Asset("controller"), "status", 0);
+                Session.PowerRange = PowerProtocol.ReadRange(status.Output);
+                log(string.Format(CultureInfo.InvariantCulture, "OEM baseline={0:0.###} W; selectable range={1}-{2} W; step={3} W. Software ceiling is not a hardware rating.",
+                    Session.PowerRange.OemWatts, Session.PowerRange.MinimumWatts, Session.PowerRange.MaximumWatts, PowerProtocol.StepWatts));
+            } catch (Exception error) {
+                Session.PowerRangeError = error.Message;
+                log("Power adjustment disabled: " + error.Message);
+            }
         }
 
         private uint ReadEfiFlags(string helper)
@@ -142,6 +163,8 @@ namespace Nvpwr
             } catch (Exception error) { failure = error; }
             finally {
                 Session.Ready = false;
+                Session.PowerRange = null;
+                Session.PowerRangeError = null;
                 try { if (Session.NeedsRestore) Restore(); }
                 catch (Exception error) { failure = new InvalidOperationException((failure == null ? "" : failure.Message + "\n") + "DSE RECOVERY FAILED: " + error.Message); }
             }
@@ -155,8 +178,12 @@ namespace Nvpwr
         {
             RequireAdmin();
             if (!Session.Ready || Session.NeedsRestore || Session.RestartRequired) throw new InvalidOperationException("Driver session is not ready.");
-            if (!PowerProtocol.IsValid(watts)) throw new ArgumentOutOfRangeException("watts", "Expected 175-300 W in 5 W steps.");
-            system.ReadGpu();
+            if (!PowerProtocol.IsValid(watts)) throw new ArgumentOutOfRangeException("watts", "Target must be within the software bounds in 5 W steps.");
+            RefreshPowerRange();
+            if (Session.PowerRange == null) throw new InvalidOperationException(Session.PowerRangeError ?? "OEM baseline is unavailable; no power write was attempted.");
+            if (!Session.PowerRange.Contains(watts)) throw new ArgumentOutOfRangeException("watts", string.Format(CultureInfo.InvariantCulture,
+                "Target must be {0}-{1} W in 5 W steps. Values below the current OEM baseline ({2:0.###} W) are not supported by this loading path.",
+                Session.PowerRange.MinimumWatts, Session.PowerRange.MaximumWatts, Session.PowerRange.OemWatts));
             Session.LastReadback = null;
             log("NvpwrCtl set 5050 " + watts);
             string controller = system.Asset("controller");

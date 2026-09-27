@@ -30,7 +30,7 @@ namespace Nvpwr
                     string screenshots = AppPaths.Beside("diagnostics", "ui");
                     window.RunUiChecks(screenshots);
                     app.Shutdown();
-                    Report("PASS: native protocol/backends, grouped logs, 175-300 W input, fixed pages and KDU/EFI UI renders. " + screenshots);
+                    Report("PASS: native protocol/backends, grouped logs, OEM-based power ranges, fixed pages and KDU/EFI UI renders. " + screenshots);
                     return 0;
                 }
                 bool readOnly = mode == "--read-only" || mode == "--live-self-test";
